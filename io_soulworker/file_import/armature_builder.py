@@ -137,8 +137,10 @@ def build_armature_from_skeleton(
         {
             "name": bone.name,
             "parent_id": bone.parent_id,
-            "local_position": _vector_to_list(bone.local_space_position),
-            "local_orientation": _quaternion_to_list(bone.local_space_orientation),
+            "local_position": _vector_to_list(
+                vision_to_blender(bone.local_space_position)),
+            "local_orientation": _quaternion_to_list(
+                bone.local_space_orientation),
         }
         for bone in chunk.bones
     ])

@@ -12,7 +12,10 @@ from io_soulworker.file_export.operators import (
     IO_SOULWORKER_OT_export_model,
     IO_SOULWORKER_OT_export_vmesh,
 )
-from io_soulworker.file_import.animation.file_reader import AnimationFileReader
+from io_soulworker.file_import.animation.file_reader import (
+    AnimationFileReader,
+    AnimationImportSource,
+)
 from io_soulworker.file_import.collections import (
     collection_segments_under_resources,
     ensure_collection_hierarchy,
@@ -121,7 +124,11 @@ class IO_SOULWORKER_OT_open_resource(Operator, ImportHelper):
         if anim_path.is_file():
             debug("import animation: %s", anim_path)
             try:
-                AnimationFileReader(anim_path, context).run()
+                AnimationFileReader(
+                    anim_path,
+                    context,
+                    import_source=AnimationImportSource.MESH,
+                ).run()
             except Exception as exc:
                 error("Failed to import animation %s: %s", anim_path, exc)
                 self.report(

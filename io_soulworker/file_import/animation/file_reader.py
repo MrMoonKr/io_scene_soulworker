@@ -1,6 +1,7 @@
 import bpy
 
 from collections.abc import Callable
+from enum import Enum
 from dataclasses import dataclass
 from json import loads
 from logging import debug
@@ -32,6 +33,16 @@ class SkeletonBoneRef:
     local_orientation: Quaternion
 
 
+class AnimationImportSource(Enum):
+    """How the importer chooses armature targets."""
+
+    MESH = "mesh"
+    """Sidecar import after a model — match scene object name to ``.anim`` stem."""
+
+    USER = "user"
+    """Explicit user import — selection when non-empty, otherwise match by name."""
+
+
 class AnimationFileReader(AnimationFileChunkReader):
 
     skeletons: list[VisSkeletonChunk_cl]
@@ -55,9 +66,12 @@ class AnimationFileReader(AnimationFileChunkReader):
         if self.animation_name is None:
             return
 
-        armature_object = self._resolve_armature_object(self.skeleton_index)
+        armature_objects = self._resolve_armature_objects(self.skeleton_index)
 
-        if armature_object is None:
+        if self.animation_name is not None:
+            self._animation_clip_count += 1
+
+        if not armature_objects:
             debug(
                 "No armature found for skeleton index %d",
                 self.skeleton_index)
@@ -77,30 +91,36 @@ class AnimationFileReader(AnimationFileChunkReader):
             debug("Animation %s has no supported tracks", self.animation_name)
             return
 
-        bone_names = self._bone_names_for_animation(armature_object)
-        action = self._create_action(
-            self._import_action_name(self.animation_name))
-
-        animation_data = armature_object.animation_data_create()
-        animation_data.action = action
-
-        if has_bone_tracks:
-            self._add_transform_curves(
-                action,
-                armature_object,
-                bone_names,
-                self.position_chunk,
-                self.rotation_chunk,
-                self.scale_chunk,
+        for armature_object in armature_objects:
+            bone_names = self._bone_names_for_animation(armature_object)
+            action_name = self._import_action_name(
+                self.animation_name,
+                armature_object.name if len(armature_objects) > 1 else None,
             )
+            action = self._create_action(action_name)
 
-        if has_root_motion:
-            self._add_root_motion_curves(
-                action,
-                armature_object,
-                self.offset_delta_chunk,
-                self.rotation_delta_chunk,
-            )
+            animation_data = armature_object.animation_data_create()
+            animation_data.action = action
+
+            if has_bone_tracks:
+                self._add_transform_curves(
+                    action,
+                    armature_object,
+                    bone_names,
+                    self.position_chunk,
+                    self.rotation_chunk,
+                    self.scale_chunk,
+                )
+
+            if has_root_motion:
+                self._add_root_motion_curves(
+                    action,
+                    armature_object,
+                    self.offset_delta_chunk,
+                    self.rotation_delta_chunk,
+                )
+
+        self._applied_animation_count += 1
 
     def on_skeleton(self, chunk: VisSkeletonChunk_cl) -> None:
 
@@ -127,14 +147,31 @@ class AnimationFileReader(AnimationFileChunkReader):
         self.offset_delta_chunk = chunk.offset
         self.rotation_delta_chunk = chunk.rotation
 
-    def _report_user_error(self, key: str, message: str) -> None:
+    def _report_user_warning(self, key: str, message: str) -> None:
 
-        if self.report_error is None or key in self._reported_error_keys:
+        if self.report_warning is None or key in self._reported_warning_keys:
 
             return
 
-        self._reported_error_keys.add(key)
-        self.report_error(message)
+        self._reported_warning_keys.add(key)
+        self.report_warning(message)
+
+    def _has_selection(self) -> bool:
+
+        return bool(self.context.selected_objects)
+
+    def _armatures_by_name(self, skeleton_index: int) -> list[Object]:
+        target = self._scene_object_matching_file()
+
+        if target is None:
+            return []
+
+        armature = self._armature_from_modifiers(target, skeleton_index)
+
+        if armature is None:
+            return []
+
+        return [armature]
 
     def _scene_object_matching_file(self) -> Object | None:
 
@@ -165,29 +202,93 @@ class AnimationFileReader(AnimationFileChunkReader):
 
         return chosen
 
-    def _resolve_armature_object(self, skeleton_index: int) -> Object | None:
-        target = self._scene_object_matching_file()
+    def _armatures_from_selection(self) -> list[Object]:
+        """Armature objects referenced by the current selection."""
 
-        if target is None:
-            self._report_user_error(
-                "missing_scene_object",
-                (
-                    f'There is no object named "{self.path.stem}" in the current scene '
-                    f"(the object name must match the animation filename without extension)."
-                ),
+        seen: set[int] = set()
+        armatures: list[Object] = []
+
+        for obj in self.context.selected_objects:
+            if obj.type == 'ARMATURE':
+                key = obj.as_pointer()
+
+                if key not in seen:
+                    seen.add(key)
+                    armatures.append(obj)
+
+            for modifier in obj.modifiers:
+                if not isinstance(modifier, ArmatureModifier):
+                    continue
+
+                armature = modifier.object
+
+                if armature is None:
+                    continue
+
+                key = armature.as_pointer()
+
+                if key not in seen:
+                    seen.add(key)
+                    armatures.append(armature)
+
+        return armatures
+
+    def _armatures_from_selection_indexed(
+            self,
+            skeleton_index: int) -> list[Object]:
+        armatures = self._armatures_from_selection()
+
+        if not armatures:
+            return []
+
+        if skeleton_index == 0:
+            return armatures
+
+        if skeleton_index < len(armatures):
+            return [armatures[skeleton_index]]
+
+        return []
+
+    def _resolve_armature_objects(self, skeleton_index: int) -> list[Object]:
+        """Targets for the animation clip at ``skeleton_index``."""
+
+        if self.import_source == AnimationImportSource.MESH:
+            return self._armatures_by_name(skeleton_index)
+
+        if self._has_selection():
+            return self._armatures_from_selection_indexed(skeleton_index)
+
+        return self._armatures_by_name(skeleton_index)
+
+    def run(self) -> None:
+
+        super().run()
+        self._finish_import()
+
+    def _finish_import(self) -> None:
+
+        if self.import_source != AnimationImportSource.USER:
+            return
+
+        if self._applied_animation_count > 0:
+            return
+
+        if self._animation_clip_count == 0:
+            return
+
+        if self._has_selection():
+            message = (
+                f'Could not apply "{self.path.name}": '
+                "the current selection has no armature to animate."
             )
-            return None
+        else:
+            message = (
+                f'Could not apply "{self.path.name}": '
+                f'no scene object named "{self.path.stem}" with an armature '
+                "modifier was found."
+            )
 
-        armature = self._armature_from_modifiers(target, skeleton_index)
-
-        if armature is None:
-            self._report_user_error(
-                f"missing_armature:{skeleton_index}", (f'Object "{
-                    target.name}" has no Armature modifier at index {skeleton_index} ' f"(it must be the {
-                    skeleton_index + 1}th Armature modifier on the object)."), )
-            return None
-
-        return armature
+        self._report_user_warning("no_targets", message)
 
     def _skeleton_at_index(
             self,
@@ -213,8 +314,16 @@ class AnimationFileReader(AnimationFileChunkReader):
 
         return [bone.name for bone in armature_object.data.bones][:self.bone_count]
 
-    def _import_action_name(self, animation_name: str) -> str:
-        return f"{self.path.stem}:{animation_name}"
+    def _import_action_name(
+            self,
+            animation_name: str,
+            armature_name: str | None = None) -> str:
+        base = f"{self.path.stem}:{animation_name}"
+
+        if armature_name is None:
+            return base
+
+        return f"{base}@{armature_name}"
 
     def _create_action(self, name: str) -> Action:
         existing = bpy.data.actions.get(name)
@@ -291,9 +400,9 @@ class AnimationFileReader(AnimationFileChunkReader):
             pose_bone.rotation_mode = 'QUATERNION'
             positions_by_bone[bone_name] = {
                 frame: self._remap_translation(
-                    position,
+                    vision_to_blender(position.to_3d()),
                     source_ref,
-                    target_ref
+                    target_ref,
                 )
                 for frame, position in position_keys.get(source_ref.name, [])
             }
@@ -532,7 +641,7 @@ class AnimationFileReader(AnimationFileChunkReader):
             SkeletonBoneRef(
                 name=bone.name,
                 parent_name=bone_names_by_id.get(bone.parent_id),
-                local_position=bone.local_space_position,
+                local_position=vision_to_blender(bone.local_space_position),
                 local_orientation=bone.local_space_orientation,
             )
             for bone in chunk.bones
@@ -764,14 +873,21 @@ class AnimationFileReader(AnimationFileChunkReader):
         self,
         path: Path,
         context: bpy.types.Context,
+        *,
+        import_source: AnimationImportSource = AnimationImportSource.USER,
         report_error: Callable[[str], None] | None = None,
+        report_warning: Callable[[str], None] | None = None,
     ) -> None:
 
         super().__init__(path)
 
         self.context = context
+        self.import_source = import_source
         self.report_error = report_error
-        self._reported_error_keys: set[str] = set()
+        self.report_warning = report_warning
+        self._reported_warning_keys: set[str] = set()
+        self._animation_clip_count = 0
+        self._applied_animation_count = 0
         self.skeletons = []
         self.animation_name = None
         self.skeleton_index = 0
